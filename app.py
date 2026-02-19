@@ -3,21 +3,24 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import datetime
 import hashlib
-import feedparser
 import re
-from pydantic import BaseModel, Field
+import feedparser
 from typing import List
+from pydantic import BaseModel, Field
 from google import genai
+
+# Email (SMTP) para prueba de newsletter
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
 
 # ============================
 # UI
 # ============================
-st.set_page_config(page_title="AMC Intelligence Hub (MVP)", page_icon="🧠", layout="wide")
-st.title("🧠 AMC Intelligence Hub — MVP")
-st.caption(
-    "MVP: lee RSS desde Firestore (`sources`), analiza con Gemini (JSON), guarda noticias curadas en `news_articles` "
-    "y genera digests por departamento en `newsletters`."
-)
+st.set_page_config(page_title="AMC Intelligence Hub", page_icon="🧠", layout="wide")
+st.title("🧠 AMC Intelligence Hub")
+st.caption("RSS → Gemini → Firestore → Digest → (Prueba Email)")
 
 # ============================
 # Firestore
@@ -41,7 +44,7 @@ try:
     db = get_db()
     st.success("✅ Conectado a Firestore")
 except Exception as e:
-    st.error(f"❌ No se pudo conectar a Firestore: {e}")
+    st.error(f"❌ Error conectando Firestore: {e}")
     st.stop()
 
 # ============================
@@ -77,19 +80,29 @@ class Analysis(BaseModel):
     score: int = Field(ge=0, le=100, description="Relevancia 0-100")
 
 # ============================
-# Utils
+# Utilidades
 # ============================
-def sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
 def utcnow():
     return datetime.datetime.utcnow()
 
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def sanitize_doc_id(raw: str) -> str:
+    # Firestore NO permite "/" en document IDs; sanitizamos todo a [a-z0-9_-]
+    return re.sub(r"[^a-z0-9_-]+", "_", raw.lower()).strip("_")
+
+# ============================
+# Sources (RSS)
+# ============================
 def load_sources():
     """
-    Lee fuentes desde Firestore:
-      collection: sources
-      fields: {name, type:'rss', url, enabled:true}
+    Firestore collection: sources
+    fields:
+      - name (str)
+      - type = "rss"
+      - url (str)
+      - enabled (bool)
     """
     docs = db.collection("sources").where("enabled", "==", True).stream()
     sources = []
@@ -110,12 +123,15 @@ def fetch_rss(url: str, max_items: int = 10):
             out.append({"title": title, "url": link, "summary": summary})
     return out
 
+# ============================
+# Gemini análisis
+# ============================
 def analyze_item(source: str, title: str, url: str, summary: str) -> Analysis:
     prompt = f"""
 Eres analista de inteligencia competitiva para AMC Global (alimentos/ingredientes).
 Debes curar noticias de IA, digitalización y tecnología aplicada al negocio.
 
-Devuelve SOLO JSON válido siguiendo el schema.
+Devuelve SOLO JSON válido siguiendo este schema.
 
 Departamentos permitidos:
 {DEPARTMENTS}
@@ -145,7 +161,7 @@ Reglas:
 
 def upsert_news(item, analysis: Analysis, source_name: str) -> bool:
     """
-    Deduplicación fuerte por URL: doc_id = sha256(url)
+    Deduplicación fuerte por URL: documentId = sha256(url)
     """
     doc_id = sha256(item["url"])
     ref = db.collection("news_articles").document(doc_id)
@@ -153,6 +169,7 @@ def upsert_news(item, analysis: Analysis, source_name: str) -> bool:
         return False
 
     dept = analysis.departamento if analysis.departamento in DEPARTMENTS else "Innovación y Tendencias"
+
     ref.set({
         "title": analysis.titulo_mejorado,
         "url": item["url"],
@@ -170,7 +187,7 @@ def upsert_news(item, analysis: Analysis, source_name: str) -> bool:
     return True
 
 # ============================
-# Newsletter (Digest) Builder
+# Digest (newsletter HTML)
 # ============================
 def load_recent_news(limit: int = 250):
     docs = (
@@ -234,11 +251,8 @@ def build_digest_html(dept: str, items: list, date_label: str) -> str:
     """
 
 def save_digest(date_label: str, dept: str, items: list, html: str, min_score: int):
-    # ID estable y seguro (Firestore NO permite "/" en document IDs)
-    raw = f"{date_label}__{dept}".lower()
-
-    # Reemplaza cualquier cosa rara (incluye /, &, espacios, etc.) por "_"
-    doc_id = re.sub(r"[^a-z0-9_-]+", "_", raw).strip("_")
+    raw = f"{date_label}__{dept}"
+    doc_id = sanitize_doc_id(raw)
 
     db.collection("newsletters").document(doc_id).set({
         "date": date_label,
@@ -251,21 +265,62 @@ def save_digest(date_label: str, dept: str, items: list, html: str, min_score: i
 
     return doc_id
 
+def get_latest_digest_for_dept(dept: str):
+    docs = (
+        db.collection("newsletters")
+        .where("department", "==", dept)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+    dig = list(docs)
+    return dig[0].to_dict() if dig else None
+
 # ============================
-# Sidebar Controls
+# Email test (SMTP)
+# ============================
+def smtp_ready() -> bool:
+    keys = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"]
+    return all(k in st.secrets for k in keys)
+
+def send_html_email(to_email: str, subject: str, html: str) -> None:
+    host = st.secrets["SMTP_HOST"]
+    port = int(st.secrets["SMTP_PORT"])
+    user = st.secrets["SMTP_USER"]
+    pwd  = st.secrets["SMTP_PASS"]
+    from_name = st.secrets.get("SMTP_FROM_NAME", "AMC Intelligence Hub")
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"{from_name} <{user}>"
+    msg["To"] = to_email
+    msg["Subject"] = Header(subject, "utf-8")
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    server = smtplib.SMTP(host, port, timeout=60)
+    server.starttls()
+    server.login(user, pwd)
+    server.send_message(msg)
+    server.quit()
+
+# ============================
+# Sidebar: controles
 # ============================
 with st.sidebar:
-    st.header("⚙️ Control del pipeline")
+    st.header("⚙️ Pipeline")
 
     min_score = st.slider("Score mínimo para guardar", 0, 100, 70, 1)
-    max_per_source = st.slider("Máx items por fuente (RSS)", 1, 30, 8, 1)
+    max_per_source = st.slider("Máx items por fuente", 1, 30, 8, 1)
     max_total = st.slider("Máx total por corrida", 1, 100, 25, 1)
 
     if st.button("🚀 Run Pipeline (RSS → Gemini → Firestore)"):
         sources = load_sources()
         if not sources:
-            st.error("No hay sources enabled=true en Firestore.")
+            st.error("No hay fuentes activas (sources enabled=true).")
             st.stop()
+
+        run_id = utcnow().strftime("%Y%m%dT%H%M%SZ")
+        run_ref = db.collection("runs").document(run_id)
+        run_ref.set({"started_at": utcnow(), "status": "running", "mode": "streamlit"}, merge=True)
 
         prog = st.progress(0)
         total_done = 0
@@ -273,18 +328,13 @@ with st.sidebar:
         analyzed = 0
         errors = 0
 
-        run_id = utcnow().strftime("%Y%m%dT%H%M%SZ")
-        run_ref = db.collection("runs").document(run_id)
-        run_ref.set({"started_at": utcnow(), "status": "running"}, merge=True)
-
         try:
             for s in sources:
                 if total_done >= max_total:
                     break
 
                 name = s.get("name", "RSS")
-                url = s["url"]
-                items = fetch_rss(url, max_items=max_per_source)
+                items = fetch_rss(s["url"], max_items=max_per_source)
 
                 for it in items:
                     if total_done >= max_total:
@@ -312,15 +362,15 @@ with st.sidebar:
                 "min_score": min_score
             }, merge=True)
 
-            st.success(f"✅ Pipeline terminado. analyzed={analyzed} added={added} errors={errors}")
-            st.toast("Listo. Revisa el feed y luego genera digests.", icon="✅")
+            st.success(f"✅ Pipeline: analyzed={analyzed} added={added} errors={errors}")
+            st.rerun()
 
         except Exception as e:
             run_ref.set({"status": "error", "error": str(e)}, merge=True)
             st.error(f"❌ Pipeline falló: {e}")
 
     st.divider()
-    st.subheader("🧾 Newsletter (Digest)")
+    st.header("🧾 Digest")
 
     if st.button("🧾 Generar digest por departamento (últimas 24h)"):
         all_news = load_recent_news(limit=250)
@@ -341,15 +391,13 @@ with st.sidebar:
             save_digest(date_label, dept, dept_news, html, min_score)
             created += 1
 
-        st.success(f"✅ Digests generados: {created} (1 por departamento)")
+        st.success(f"✅ Digests generados: {created}")
         st.rerun()
 
 # ============================
-# Main: Feed
+# Main: noticias
 # ============================
-st.divider()
 st.subheader("📰 Noticias curadas (últimas 50)")
-
 docs = db.collection("news_articles").order_by("published_at", direction=firestore.Query.DESCENDING).limit(50).stream()
 news = [d.to_dict() for d in docs]
 
@@ -368,10 +416,10 @@ else:
         st.divider()
 
 # ============================
-# Main: Digests
+# Main: digests
 # ============================
-st.subheader("🧾 Newsletters generadas (últimas 10)")
-dig = db.collection("newsletters").order_by("created_at", direction=firestore.Query.DESCENDING).limit(10).stream()
+st.subheader("🧾 Newsletters generadas (últimas 5)")
+dig = db.collection("newsletters").order_by("created_at", direction=firestore.Query.DESCENDING).limit(5).stream()
 digests = [d.to_dict() for d in dig]
 
 if not digests:
@@ -381,3 +429,34 @@ else:
         st.markdown(f"### {d.get('date')} — {d.get('department')}")
         st.components.v1.html(d.get("html", ""), height=420, scrolling=True)
         st.divider()
+
+# ============================
+# Main: enviar prueba
+# ============================
+st.subheader("📧 Enviar newsletter de prueba")
+
+if not smtp_ready():
+    st.warning("Para enviar prueba, agrega SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS en Secrets.")
+else:
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        dept_test = st.selectbox("Departamento", DEPARTMENTS, index=0)
+    with c2:
+        to_email = st.text_input("Enviar a (tu correo)", value="")
+    with c3:
+        send_btn = st.button("📨 Enviar prueba")
+
+    if send_btn:
+        if not to_email.strip():
+            st.error("Escribe un email destino.")
+        else:
+            d = get_latest_digest_for_dept(dept_test)
+            if not d:
+                st.error("No encontré digest para ese departamento. Genera digests primero.")
+            else:
+                subject = f"AMC Digest Test — {d.get('department')} — {d.get('date')}"
+                try:
+                    send_html_email(to_email.strip(), subject, d.get("html", ""))
+                    st.success(f"✅ Enviado a {to_email}")
+                except Exception as e:
+                    st.error(f"❌ Falló el envío: {e}")
