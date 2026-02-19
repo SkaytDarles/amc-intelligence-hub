@@ -4,6 +4,7 @@ from firebase_admin import credentials, firestore
 import datetime
 import hashlib
 import feedparser
+import re
 from pydantic import BaseModel, Field
 from typing import List
 from google import genai
@@ -233,7 +234,12 @@ def build_digest_html(dept: str, items: list, date_label: str) -> str:
     """
 
 def save_digest(date_label: str, dept: str, items: list, html: str, min_score: int):
-    doc_id = f"{date_label}__{dept}".replace(" ", "_").replace("&", "and").lower()
+    # ID estable y seguro (Firestore NO permite "/" en document IDs)
+    raw = f"{date_label}__{dept}".lower()
+
+    # Reemplaza cualquier cosa rara (incluye /, &, espacios, etc.) por "_"
+    doc_id = re.sub(r"[^a-z0-9_-]+", "_", raw).strip("_")
+
     db.collection("newsletters").document(doc_id).set({
         "date": date_label,
         "department": dept,
@@ -242,6 +248,7 @@ def save_digest(date_label: str, dept: str, items: list, html: str, min_score: i
         "items": [{"title": i.get("title"), "url": i.get("url")} for i in items],
         "html": html
     }, merge=True)
+
     return doc_id
 
 # ============================
