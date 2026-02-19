@@ -1,0 +1,4 @@
+feedparser
+google-genai
+pydantic
+google-cloud-firestore
