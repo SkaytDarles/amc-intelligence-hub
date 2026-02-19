@@ -30,7 +30,11 @@ def get_db():
 try:
     db = get_db()
     st.success("✅ Conectado a Firestore")
-    # --- DEBUG: confirma que Streamlit apunta al MISMO proyecto que tu Firebase Console ---
+  
+        except Exception as e:
+            st.error(f"❌ Healthcheck falló: {e}")
+
+# --- DEBUG: confirma que Streamlit apunta al MISMO proyecto que tu Firebase Console ---
 try:
     key_dict = dict(st.secrets["FIREBASE_KEY"])
     st.write("🔎 Project ID (desde secrets):", key_dict.get("project_id"))
@@ -45,33 +49,6 @@ try:
 except Exception as e:
     st.warning(f"No pude listar sources: {e}")
 
-except Exception as e:
-    st.error(f"❌ No se pudo conectar a Firestore: {e}")
-    st.stop()
-
-st.divider()
-
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.subheader("Healthcheck")
-    if st.button("✅ Probar escritura/lectura"):
-        try:
-            # Escribe un documento “health” (no rompe nada del futuro)
-            now = datetime.datetime.utcnow().isoformat() + "Z"
-            ref = db.collection("healthchecks").document("streamlit")
-            ref.set({
-                "last_check": now,
-                "status": "ok",
-                "app": "amc-intelligence-hub-mvp"
-            }, merge=True)
-
-            # Lee el mismo documento
-            data = ref.get().to_dict()
-            st.success("✅ Escritura/lectura OK")
-            st.json(data)
-        except Exception as e:
-            st.error(f"❌ Healthcheck falló: {e}")
 
 with col2:
     st.subheader("Vista rápida de configuración")
