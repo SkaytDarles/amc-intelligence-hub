@@ -30,6 +30,21 @@ def get_db():
 try:
     db = get_db()
     st.success("✅ Conectado a Firestore")
+    # --- DEBUG: confirma que Streamlit apunta al MISMO proyecto que tu Firebase Console ---
+try:
+    key_dict = dict(st.secrets["FIREBASE_KEY"])
+    st.write("🔎 Project ID (desde secrets):", key_dict.get("project_id"))
+except Exception as e:
+    st.warning(f"No pude leer project_id desde FIREBASE_KEY: {e}")
+
+# Lista IDs reales de la colección sources (si está en este proyecto)
+try:
+    docs_debug = list(db.collection("sources").limit(20).stream())
+    st.write("📌 sources encontrados:", len(docs_debug))
+    st.write("IDs:", [d.id for d in docs_debug])
+except Exception as e:
+    st.warning(f"No pude listar sources: {e}")
+
 except Exception as e:
     st.error(f"❌ No se pudo conectar a Firestore: {e}")
     st.stop()
