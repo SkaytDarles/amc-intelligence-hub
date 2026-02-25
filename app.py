@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -5,7 +6,8 @@ import datetime
 import hashlib
 import re
 import feedparser
-from typing import List
+from typing import List, Optional
+from collections import Counter
 from pydantic import BaseModel, Field
 from google import genai
 
@@ -21,6 +23,43 @@ from email.header import Header
 st.set_page_config(page_title="AMC Intelligence Hub", page_icon="🧠", layout="wide")
 st.title("🧠 AMC Intelligence Hub")
 st.caption("RSS → Gemini → Firestore → Digest → (Prueba Email)")
+
+# ============================
+# Helpers (time + ids)
+# ============================
+def utcnow() -> datetime.datetime:
+    # Naive UTC (consistente con Firestore Timestamp al leer)
+    return datetime.datetime.utcnow().replace(tzinfo=None)
+
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def sanitize_doc_id(raw: str) -> str:
+    # Firestore NO permite "/" en document IDs; sanitizamos todo a [a-z0-9_-]
+    return re.sub(r"[^a-z0-9_-]+", "_", raw.lower()).strip("_")
+
+def in_last_hours(ts, hours: int = 24) -> bool:
+    """Firestore suele devolver TimestampWithNanoseconds (subclase de datetime).
+    Comparamos en naive UTC.
+    """
+    if not ts:
+        return False
+    try:
+        now = utcnow()
+
+        # ts puede venir tz-aware o naive. Lo normalizamos a naive UTC.
+        if isinstance(ts, datetime.datetime):
+            if ts.tzinfo is not None:
+                ts = ts.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            else:
+                ts = ts.replace(tzinfo=None)
+        else:
+            return False
+
+        delta = now - ts
+        return 0 <= delta.total_seconds() <= hours * 3600
+    except Exception:
+        return False
 
 # ============================
 # Firestore
@@ -55,7 +94,7 @@ if "GOOGLE_API_KEY" not in st.secrets:
     st.stop()
 
 client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = "gemini-3-flash-preview"  # deja el que ya estabas usando
 
 DEPARTMENTS = [
     "Finanzas y ROI",
@@ -78,19 +117,6 @@ class Analysis(BaseModel):
     departamento: str = Field(description="Uno de los departamentos permitidos")
     topics: List[str] = Field(default_factory=list, description="máx 4 tags")
     score: int = Field(ge=0, le=100, description="Relevancia 0-100")
-
-# ============================
-# Utilidades
-# ============================
-def utcnow():
-    return datetime.datetime.utcnow()
-
-def sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def sanitize_doc_id(raw: str) -> str:
-    # Firestore NO permite "/" en document IDs; sanitizamos todo a [a-z0-9_-]
-    return re.sub(r"[^a-z0-9_-]+", "_", raw.lower()).strip("_")
 
 # ============================
 # Sources (RSS)
@@ -159,30 +185,36 @@ Reglas:
     )
     return Analysis.model_validate_json(resp.text)
 
+def news_ref_for_url(url: str):
+    doc_id = sha256(url)
+    return db.collection("news_articles").document(doc_id)
+
 def upsert_news(item, analysis: Analysis, source_name: str) -> bool:
     """
-    Deduplicación fuerte por URL: documentId = sha256(url)
+    Deduplicación por URL: documentId = sha256(url)
+    Guardamos SIEMPRE (aunque score sea bajo) y filtramos sólo en el digest.
     """
-    doc_id = sha256(item["url"])
-    ref = db.collection("news_articles").document(doc_id)
+    ref = news_ref_for_url(item["url"])
     if ref.get().exists:
         return False
 
     dept = analysis.departamento if analysis.departamento in DEPARTMENTS else "Innovación y Tendencias"
+    score = int(analysis.score)
 
     ref.set({
         "title": analysis.titulo_mejorado,
         "url": item["url"],
         "source": source_name,
-        "published_at": utcnow(),
+        "published_at": utcnow(),  # timestamp de ingesta (para ventana 24h)
         "analysis": {
             "departamento": dept,
             "resumen_ejecutivo": analysis.resumen,
             "accion_sugerida": analysis.accion,
-            "relevancia_score": int(analysis.score),
+            "relevancia_score": score,
             "topics": analysis.topics[:4],
             "model": GEMINI_MODEL,
-        }
+        },
+        "is_relevant": score >= 60
     })
     return True
 
@@ -197,16 +229,6 @@ def load_recent_news(limit: int = 250):
         .stream()
     )
     return [d.to_dict() for d in docs]
-
-def in_last_hours(ts, hours: int = 24):
-    if not ts:
-        return False
-    now = utcnow()
-    try:
-        delta = now - ts.replace(tzinfo=None)
-        return delta.total_seconds() <= hours * 3600
-    except Exception:
-        return False
 
 def build_digest_html(dept: str, items: list, date_label: str) -> str:
     rows = ""
@@ -250,7 +272,7 @@ def build_digest_html(dept: str, items: list, date_label: str) -> str:
     </div>
     """
 
-def save_digest(date_label: str, dept: str, items: list, html: str, min_score: int):
+def save_digest(date_label: str, dept: str, items: list, html: str, min_score: int, window_hours: int):
     raw = f"{date_label}__{dept}"
     doc_id = sanitize_doc_id(raw)
 
@@ -258,6 +280,7 @@ def save_digest(date_label: str, dept: str, items: list, html: str, min_score: i
         "date": date_label,
         "department": dept,
         "min_score": min_score,
+        "window_hours": window_hours,
         "created_at": utcnow(),
         "items": [{"title": i.get("title"), "url": i.get("url")} for i in items],
         "html": html
@@ -308,9 +331,12 @@ def send_html_email(to_email: str, subject: str, html: str) -> None:
 with st.sidebar:
     st.header("⚙️ Pipeline")
 
-    min_score = st.slider("Score mínimo para guardar", 0, 100, 70, 1)
+    # IMPORTANTE:
+    # Ya NO usamos "min_score para guardar" como filtro duro (ese era el bug más común).
+    # Guardamos todo y filtramos al crear el digest.
     max_per_source = st.slider("Máx items por fuente", 1, 30, 8, 1)
-    max_total = st.slider("Máx total por corrida", 1, 100, 25, 1)
+    max_total = st.slider("Máx total por corrida", 1, 150, 25, 1)
+    show_debug = st.toggle("Mostrar debug", value=True)
 
     if st.button("🚀 Run Pipeline (RSS → Gemini → Firestore)"):
         sources = load_sources()
@@ -327,6 +353,8 @@ with st.sidebar:
         added = 0
         analyzed = 0
         errors = 0
+        skipped_existing = 0
+        first_errors = []
 
         try:
             for s in sources:
@@ -341,14 +369,25 @@ with st.sidebar:
                         break
                     total_done += 1
 
+                    # Ahorra $: si ya existe por URL, ni analizamos
+                    try:
+                        if news_ref_for_url(it["url"]).get().exists:
+                            skipped_existing += 1
+                            prog.progress(min(1.0, total_done / max_total))
+                            continue
+                    except Exception:
+                        # Si falla el check, igual intentamos analizar
+                        pass
+
                     try:
                         a = analyze_item(name, it["title"], it["url"], it["summary"])
                         analyzed += 1
-                        if int(a.score) >= min_score:
-                            if upsert_news(it, a, name):
-                                added += 1
-                    except Exception:
+                        if upsert_news(it, a, name):
+                            added += 1
+                    except Exception as e:
                         errors += 1
+                        if len(first_errors) < 5:
+                            first_errors.append(f"{it.get('url','(no-url)')} -> {e}")
 
                     prog.progress(min(1.0, total_done / max_total))
 
@@ -358,11 +397,16 @@ with st.sidebar:
                 "sources": len(sources),
                 "analyzed": analyzed,
                 "added": added,
+                "skipped_existing": skipped_existing,
                 "errors": errors,
-                "min_score": min_score
+                "model": GEMINI_MODEL
             }, merge=True)
 
-            st.success(f"✅ Pipeline: analyzed={analyzed} added={added} errors={errors}")
+            st.success(f"✅ Pipeline: analyzed={analyzed} added={added} skipped_existing={skipped_existing} errors={errors}")
+            if first_errors:
+                st.warning("Primeros errores (máx 5):")
+                for x in first_errors:
+                    st.write("-", x)
             st.rerun()
 
         except Exception as e:
@@ -372,23 +416,38 @@ with st.sidebar:
     st.divider()
     st.header("🧾 Digest")
 
-    if st.button("🧾 Generar digest por departamento (últimas 24h)"):
+    window_hours = st.slider("Ventana de tiempo", 24, 168, 24, 24)  # 24h a 7 días
+    min_score_digest = st.slider("Score mínimo para newsletter", 0, 100, 60, 1)
+
+    if st.button("🧾 Generar digest por departamento (ventana seleccionada)"):
         all_news = load_recent_news(limit=250)
-        last_news = [n for n in all_news if in_last_hours(n.get("published_at"), hours=24)]
+        last_news = [n for n in all_news if in_last_hours(n.get("published_at"), hours=window_hours)]
         date_label = utcnow().date().isoformat()
+
+        if show_debug:
+            st.write("DEBUG — Conteos")
+            st.write("Total (últimos 250):", len(all_news))
+            st.write(f"En últimas {window_hours}h:", len(last_news))
+
+            dept_counter = Counter([n.get("analysis", {}).get("departamento", "NA") for n in last_news])
+            st.write("Distribución por departamento:", dict(dept_counter))
+
+            scores = [int(n.get("analysis", {}).get("relevancia_score", 0)) for n in last_news]
+            st.write(f"Scores >= {min_score_digest}:", sum(1 for s in scores if s >= min_score_digest))
+            st.write("Score min/max:", (min(scores) if scores else None, max(scores) if scores else None))
 
         created = 0
         for dept in DEPARTMENTS:
             dept_news = [
                 n for n in last_news
                 if n.get("analysis", {}).get("departamento") == dept
-                and int(n.get("analysis", {}).get("relevancia_score", 0)) >= min_score
+                and int(n.get("analysis", {}).get("relevancia_score", 0)) >= min_score_digest
             ]
             dept_news.sort(key=lambda x: int(x.get("analysis", {}).get("relevancia_score", 0)), reverse=True)
             dept_news = dept_news[:10]
 
             html = build_digest_html(dept, dept_news, date_label)
-            save_digest(date_label, dept, dept_news, html, min_score)
+            save_digest(date_label, dept, dept_news, html, min_score_digest, window_hours)
             created += 1
 
         st.success(f"✅ Digests generados: {created}")
@@ -398,8 +457,20 @@ with st.sidebar:
 # Main: noticias
 # ============================
 st.subheader("📰 Noticias curadas (últimas 50)")
-docs = db.collection("news_articles").order_by("published_at", direction=firestore.Query.DESCENDING).limit(50).stream()
+only_relevant = st.toggle("Mostrar sólo relevantes (score>=60)", value=False)
+
+docs = (
+    db.collection("news_articles")
+    .order_by("published_at", direction=firestore.Query.DESCENDING)
+    .limit(80)
+    .stream()
+)
 news = [d.to_dict() for d in docs]
+
+if only_relevant:
+    news = [n for n in news if int(n.get("analysis", {}).get("relevancia_score", 0)) >= 60]
+
+news = news[:50]
 
 if not news:
     st.info("Aún no hay noticias. Corre el pipeline desde la barra lateral.")
@@ -419,7 +490,12 @@ else:
 # Main: digests
 # ============================
 st.subheader("🧾 Newsletters generadas (últimas 5)")
-dig = db.collection("newsletters").order_by("created_at", direction=firestore.Query.DESCENDING).limit(5).stream()
+dig = (
+    db.collection("newsletters")
+    .order_by("created_at", direction=firestore.Query.DESCENDING)
+    .limit(5)
+    .stream()
+)
 digests = [d.to_dict() for d in dig]
 
 if not digests:
